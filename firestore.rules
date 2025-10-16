@@ -1,0 +1,180 @@
+/**
+ * @fileoverview Firestore Security Rules for the Exam Access Control System.
+ *
+ * Core Philosophy:
+ * This ruleset enforces a strict user-ownership model for user profiles and submissions,
+ * teacher-ownership for exams and questions, and restricts access to access logs.
+ * Multi-Factor Authentication (MFA) is enforced at the Firebase Authentication level and is
+ * assumed to be properly configured.
+ *
+ * Data Structure:
+ * - /users/{userId}: Stores user profiles, accessible only to the user themselves.
+ * - /exams/{examId}: Stores exam data, accessible to the exam's teacher.
+ * - /exams/{examId}/questions/{questionId}: Stores questions for each exam, accessible to the exam's teacher.
+ * - /users/{studentId}/submissions/{submissionId}: Stores student submissions, accessible only to the student themselves.
+ * - /access_logs/{accessLogId}: Stores access logs, not accessible to any user through Firestore.
+ *
+ * Key Security Decisions:
+ * - Users can only read and write their own profile data.
+ * - Teachers can create, read, update, and delete exams they own.
+ * - Teachers can create, read, update, and delete questions for exams they own.
+ * - Students can only read and write their own submissions.
+ * - Access logs are not accessible through Firestore rules.
+ * - Listing of exams is public.
+ * - Listing of access logs is denied.
+ *
+ * Denormalization for Authorization:
+ * - Exams store the teacherId directly on the document to avoid needing a `get()` call to the teacher's profile.
+ * - Questions store the examId directly on the document to avoid needing a `get()` call to the exam document.
+ * - Submissions store the studentId and examId directly on the document to avoid needing a `get()` call to the student or exam document.
+ *
+ * Structural Segregation:
+ * - Access logs are stored in a separate top-level collection to prevent accidental exposure of sensitive data.
+ */
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    /**
+     * @description Enforces read/write access to user profiles to the owner only.
+     * @path /users/{userId}
+     * @allow (create) User with ID 'user123' creates their profile.
+     *    request.auth.uid == 'user123'
+     *    request.resource.data.id == 'user123'
+     * @allow (get, update, delete) User with ID 'user123' reads/updates/deletes their profile.
+     *    request.auth.uid == 'user123'
+     * @deny (create) User with ID 'user123' tries to create a profile for 'user456'.
+     *    request.auth.uid == 'user123'
+     *    request.resource.data.id == 'user456'
+     * @principle Enforces document ownership for writes.
+     */
+    match /users/{userId} {
+      function isOwner(userId) {
+        return request.auth.uid == userId;
+      }
+
+      function isExistingOwner(userId) {
+        return isOwner(userId) && resource != null;
+      }
+
+      allow get: if isOwner(userId);
+      allow list: if false;
+      allow create: if isOwner(userId) && request.resource.data.id == userId;
+      allow update: if isExistingOwner(userId) && request.resource.data.id == resource.data.id;
+      allow delete: if isExistingOwner(userId);
+    }
+
+    /**
+     * @description Allows public read access to exams and restricts write access to the teacher who created the exam.
+     * @path /exams/{examId}
+     * @allow (get, list) Any user can read the exam details.
+     *    true
+     * @allow (create) Teacher 'teacher123' creates an exam.
+     *    request.auth.uid == 'teacher123'
+     *    request.resource.data.teacherId == 'teacher123'
+     * @allow (update, delete) Teacher 'teacher123' updates/deletes their own exam.
+     *    request.auth.uid == 'teacher123'
+     *    resource.data.teacherId == 'teacher123'
+     * @deny (create) Teacher 'teacher123' tries to create an exam for 'teacher456'.
+     *    request.auth.uid == 'teacher123'
+     *    request.resource.data.teacherId == 'teacher456'
+     * @deny (update, delete) Teacher 'teacher123' tries to update/delete an exam created by 'teacher456'.
+     *    request.auth.uid == 'teacher123'
+     *    resource.data.teacherId == 'teacher456'
+     * @principle Allows public read access while enforcing teacher-ownership for writes.
+     */
+    match /exams/{examId} {
+      function isTeacher(teacherId) {
+        return request.auth.uid == teacherId;
+      }
+
+      function isExistingTeacher(teacherId) {
+        return isTeacher(teacherId) && resource != null;
+      }
+
+      allow get, list: if true;
+      allow create: if isTeacher(request.resource.data.teacherId);
+      allow update: if isExistingTeacher(resource.data.teacherId);
+      allow delete: if isExistingTeacher(resource.data.teacherId);
+    }
+
+    /**
+     * @description Restricts access to exam questions to the teacher who created the exam.
+     * @path /exams/{examId}/questions/{questionId}
+     * @allow (get, list) Teacher 'teacher123' reads questions for their own exam 'exam123'.
+     *    request.auth.uid == 'teacher123'
+     *    resource.data.examId == 'exam123'
+     * @allow (create) Teacher 'teacher123' creates a question for their own exam 'exam123'.
+     *    request.auth.uid == 'teacher123'
+     *    request.resource.data.examId == 'exam123'
+     * @allow (update, delete) Teacher 'teacher123' updates/deletes a question for their own exam 'exam123'.
+     *    request.auth.uid == 'teacher123'
+     *    resource.data.examId == 'exam123'
+     * @deny (create) Teacher 'teacher123' tries to create a question for 'exam456'.
+     *    request.auth.uid == 'teacher123'
+     *    request.resource.data.examId == 'exam456'
+     * @deny (update, delete) Teacher 'teacher123' tries to update/delete a question for exam 'exam456'.
+     *    request.auth.uid == 'teacher123'
+     *    resource.data.examId == 'exam456'
+     * @principle Enforces teacher-ownership for managing exam questions.
+     */
+    match /exams/{examId}/questions/{questionId} {
+      function isTeacherOfExam(examId) {
+        return get(/databases/$(database)/documents/exams/$(examId)).data.teacherId == request.auth.uid;
+      }
+
+      function isExistingTeacherOfExam(examId) {
+        return isTeacherOfExam(examId) && resource != null;
+      }
+
+      allow get, list: if isTeacherOfExam(examId);
+      allow create: if isTeacherOfExam(examId) && request.resource.data.examId == examId;
+      allow update: if isExistingTeacherOfExam(examId) && resource.data.examId == examId;
+      allow delete: if isExistingTeacherOfExam(examId) && resource.data.examId == examId;
+    }
+
+    /**
+     * @description Enforces read/write access to submissions to the owner only.
+     * @path /users/{studentId}/submissions/{submissionId}
+     * @allow (create) Student with ID 'student123' creates a submission.
+     *    request.auth.uid == 'student123'
+     *    request.resource.data.studentId == 'student123'
+     * @allow (get, update, delete) Student with ID 'student123' reads/updates/deletes their submission.
+     *    request.auth.uid == 'student123'
+     * @deny (create) Student with ID 'student123' tries to create a submission for 'student456'.
+     *    request.auth.uid == 'student123'
+     *    request.resource.data.studentId == 'student456'
+     * @principle Enforces document ownership for writes.
+     */
+    match /users/{studentId}/submissions/{submissionId} {
+      function isOwner(studentId) {
+        return request.auth.uid == studentId;
+      }
+
+      function isExistingOwner(studentId) {
+        return isOwner(studentId) && resource != null;
+      }
+
+      allow get: if isOwner(studentId);
+      allow list: if isOwner(studentId);
+      allow create: if isOwner(studentId) && request.resource.data.studentId == studentId;
+      allow update: if isExistingOwner(studentId) && request.resource.data.studentId == studentId;
+      allow delete: if isExistingOwner(studentId) && request.resource.data.studentId == studentId;
+    }
+
+    /**
+     * @description Restricts access to access logs.
+     * @path /access_logs/{accessLogId}
+     * @deny (get, list, create, update, delete) No user can access the access logs through Firestore rules.
+     *    false
+     * @principle Denies all access to access logs.
+     */
+    match /access_logs/{accessLogId} {
+      allow get: if false;
+      allow list: if false;
+      allow create: if false;
+      allow update: if false;
+      allow delete: if false;
+    }
+  }
+}
